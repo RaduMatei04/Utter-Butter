@@ -1,0 +1,9 @@
+flask==3.1.0
+numpy==1.26.4
+faster-whisper==1.1.1
+# faster-whisper 1.1.1 folosește `requests`, dar uită să o declare ca dependență
+requests==2.32.3
+# MFCC + DTW
+librosa==0.10.2.post1
+# graficele pentru documentație (evaluation/plot_signal.py)
+matplotlib==3.9.2

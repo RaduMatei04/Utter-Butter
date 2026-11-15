@@ -1,0 +1,74 @@
+# =====================================================================
+# docker-compose.yml: pornește TOATE serviciile aplicației cu o comandă:
+#     docker compose up --build
+# Aplicația se deschide la http://localhost:8090
+# =====================================================================
+
+# Numele proiectului (folderul conține „&”, pe care Docker nu îl acceptă)
+name: utterbutter
+
+services:
+
+  # ---------- Baza de date: PostgreSQL ----------
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: butter
+      POSTGRES_PASSWORD: butter       # parolă doar pentru dezvoltare locală
+      POSTGRES_DB: utterbutter
+    volumes:
+      # datele rămân salvate între reporniri (volum Docker)
+      - db-data:/var/lib/postgresql/data
+      # scriptul care creează tabelele + rețetele demo la prima pornire
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # Docker verifică periodic dacă Postgres acceptă conexiuni
+      test: ["CMD-SHELL", "pg_isready -U butter -d utterbutter"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ---------- Backend: Flask, CRUD pentru rețete ----------
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://butter:butter@db:5432/utterbutter
+    volumes:
+      # montăm codul: modificările din app.py se văd imediat (fără rebuild)
+      - ./api:/app
+    depends_on:
+      db:
+        condition: service_healthy    # pornește doar după ce Postgres e gata
+
+  # ---------- Prelucrarea vocii: Flask + Whisper ----------
+  speech:
+    build: ./speech
+    environment:
+      WHISPER_MODEL: base             # tiny / base / small
+      WHISPER_DIR: /models
+      # fiecare comandă primită se salvează aici (pentru grafice și evaluare)
+      SAVE_RECORDINGS_DIR: /evaluation/recordings
+      # setul de test pentru evaluare (înregistrat din pagina #/record)
+      DATASET_DIR: /evaluation/data
+      MPLBACKEND: Agg                 # matplotlib desenează direct în PNG, fără fereastră
+    volumes:
+      - ./speech:/app                 # codul (după modificări: docker compose restart speech)
+      - ./evaluation:/evaluation      # scripturile de grafice/evaluare + înregistrările
+      - whisper-models:/models        # modelul descărcat rămâne salvat aici
+
+  # ---------- Frontend: nginx cu SPA-ul ----------
+  web:
+    build: ./web
+    ports:
+      - "8090:80"                     # localhost:8090 -> portul 80 din container
+    volumes:
+      # montăm fișierele: modificările din HTML/CSS/JS se văd la refresh
+      - ./web/public:/usr/share/nginx/html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - speech
+
+volumes:
+  db-data:
+  whisper-models:
