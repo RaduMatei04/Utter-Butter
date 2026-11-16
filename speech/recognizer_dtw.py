@@ -1,26 +1,15 @@
 """
-recognizer_dtw.py: recunoaștere clasică, MFCC + DTW (Dynamic Time Warping).
+recognizer_dtw.py: metoda B, MFCC + DTW (fără rețea neuronală).
 
-Ideea:
-  - pentru fiecare comandă avem câteva înregistrări-model („șabloane”), în
-    templates_audio/<comanda>/*.wav, spuse de utilizator;
-  - din fiecare șablon extragem secvența de vectori MFCC (un vector / 10 ms);
-  - o comandă nouă se compară cu TOATE șabloanele prin DTW;
-  - câștigă comanda șablonului cel mai apropiat (1-nearest-neighbour);
-  - dacă și cel mai apropiat șablon e prea departe, răspunsul e „unknown”.
-
-De ce DTW și nu o simplă diferență între vectori?
-  Aceeași comandă e spusă de fiecare dată cu altă viteză („neeext” vs „next”).
-  DTW găsește cea mai bună „aliniere” în timp între cele două secvențe:
-  poate întinde sau comprima timpul, ca sunetele asemănătoare să fie comparate între ele.
-
-Avantaje:      nu are nevoie de rețea neuronală, e rapid, merge cu 3–5 exemple.
-Dezavantaje:   recunoaște doar comenzile fixe pentru care există șabloane,
-               depinde de vorbitor și nu poate extrage numere („timer 5 minutes”).
+  - Pentru fiecare comandă avem câteva înregistrări-model („șabloane”):
+    templates_audio/<comanda>/*.wav, spuse de utilizator.
+  - O comandă nouă se compară prin DTW cu toate șabloanele.
+  - Câștigă comanda celui mai apropiat șablon.
+  - Dacă și cel mai apropiat e prea departe, răspunsul e „unknown”.
 """
 
 import os
-import threading
+from collections import Counter
 from pathlib import Path
 
 import numba
@@ -30,158 +19,82 @@ from features import mfcc
 from preprocessing import SAMPLE_RATE, load_wav_file, preprocess
 
 TEMPLATES_DIR = Path(os.environ.get("TEMPLATES_DIR", Path(__file__).parent / "templates_audio"))
+REJECT_FACTOR = 1.5   # prag = 1.5 × distanța obișnuită dintre două șabloane ale aceleiași comenzi
+MAX_SECONDS = 2.5     # comenzile sunt scurte; mai lung = conversație
 
-# Pragul de respingere = REJECT_FACTOR × distanța tipică dintre două șabloane
-# ale ACELEIAȘI comenzi (calculată automat din șabloanele tale).
-REJECT_FACTOR = 1.5
-
-# Comenzile sunt scurte; un segment mai lung de atât e conversație, nu comandă.
-MAX_COMMAND_SECONDS = 2.5
-
-_templates = []      # listă de (acțiune, nume_fișier, matrice_MFCC)
-_threshold = None    # pragul de respingere (None = încă nu se poate calcula)
-_lock = threading.Lock()
+templates = []        # listă de (comanda, MFCC)
+threshold = None      # pragul de respingere (None = prea puține șabloane ca să-l calculăm)
 
 
-# ======================================================================
-# Trăsături
-# ======================================================================
-
-def extract_features(clean_signal):
-    """Semnal preprocesat -> matrice (număr_cadre, 13) cu vectori MFCC.
-
-    CMVN (Cepstral Mean and Variance Normalization): din fiecare coeficient
-    scădem media și împărțim la deviația standard, pe toată înregistrarea.
-    Așa eliminăm diferențele „constante” (alt microfon, altă distanță,
-    alt volum) și rămâne doar forma sunetelor."""
-    features = mfcc(clean_signal).T                    # (cadre, 13)
-    mean = features.mean(axis=0)
-    std = features.std(axis=0) + 1e-10
-    return ((features - mean) / std).astype(np.float64)
+def features_of(clean_signal):
+    """MFCC + CMVN: fiecare coeficient adus la medie 0 și deviație 1.
+    Așa nu mai contează volumul sau microfonul, doar forma sunetelor.
+    Întoarce o matrice (număr_cadre, 13): un vector la fiecare 10 ms."""
+    features = mfcc(clean_signal).T
+    return (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-10)
 
 
-# ======================================================================
-# DTW, scris explicit
-# ======================================================================
-
-@numba.njit(cache=True)
+@numba.njit(cache=True)   # numba transformă funcția în cod mașină (de ~100 de ori mai rapid)
 def dtw_distance(a, b):
-    """Distanța DTW între două secvențe de vectori, a (n × 13) și b (m × 13).
+    """Dynamic Time Warping: cea mai bună aliniere în timp între două secvențe.
 
-    D[i, j] = costul celei mai bune alinieri între primele i cadre din `a`
-              și primele j cadre din `b`:
+    D[i, j] = d(a[i], b[j]) + min(D[i-1, j], D[i, j-1], D[i-1, j-1])
 
-        D[i, j] = d(a[i], b[j]) + min( D[i-1, j],      (a avansează, b „stă pe loc”)
-                                       D[i, j-1],      (b avansează, a „stă pe loc”)
-                                       D[i-1, j-1] )   (avansează amândouă)
-
-    unde d = distanța euclidiană între doi vectori MFCC.
-    Rezultatul se împarte la (n + m), ca să putem compara secvențe de lungimi diferite.
-
-    @numba.njit compilează funcția în cod mașină la prima rulare
-    (două bucle for în Python pur ar fi de ~100 de ori mai lente)."""
-    n, m = a.shape[0], b.shape[0]
+    Așa „next” spus repede și „neeext” spus rar se pot compara cadru cu cadru.
+    Împărțim la n + m ca să putem compara secvențe de lungimi diferite."""
+    n, m = len(a), len(b)
     D = np.full((n + 1, m + 1), np.inf)
     D[0, 0] = 0.0
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            diff = a[i - 1] - b[j - 1]
-            cost = np.sqrt(np.sum(diff * diff))
+            cost = np.sqrt(np.sum((a[i - 1] - b[j - 1]) ** 2))   # distanța euclidiană
             D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
     return D[n, m] / (n + m)
 
 
-# ======================================================================
-# Șabloanele
-# ======================================================================
-
 def load_templates():
-    """Citește toate șabloanele din templates_audio/<acțiune>/*.wav
-    și recalculează pragul de respingere."""
-    global _templates, _threshold
+    """Citește toate șabloanele și calculează pragul de respingere."""
+    global templates, threshold
     templates = []
-    if TEMPLATES_DIR.exists():
-        for folder in sorted(TEMPLATES_DIR.iterdir()):
-            if not folder.is_dir():
-                continue
-            for path in sorted(folder.glob("*.wav")):
-                clean, _ = preprocess(load_wav_file(path))
-                if clean is None:
-                    print(f"[dtw] skipped {path.name}: no speech", flush=True)
-                    continue
-                templates.append((folder.name, path.name, extract_features(clean)))
+    for path in sorted(TEMPLATES_DIR.glob("*/*.wav")):
+        clean = preprocess(load_wav_file(path))
+        if clean is not None:
+            templates.append((path.parent.name, features_of(clean)))
 
-    threshold = _compute_threshold(templates)
-    with _lock:
-        _templates = templates
-        _threshold = threshold
+    # Pentru fiecare șablon: cât de departe e cel mai apropiat ALT șablon al aceleiași comenzi?
+    closest = []
+    for i, (action, feats) in enumerate(templates):
+        others = [dtw_distance(feats, f) for j, (a, f) in enumerate(templates) if a == action and j != i]
+        if others:
+            closest.append(min(others))
+    threshold = REJECT_FACTOR * float(np.median(closest)) if closest else None
 
-    counts = template_counts()
-    print(f"[dtw] {len(templates)} templates loaded {counts}, threshold={threshold}", flush=True)
-    return counts
-
-
-def _compute_threshold(templates):
-    """Pentru fiecare șablon căutăm cel mai apropiat ALT șablon al aceleiași comenzi.
-    Mediana acestor distanțe = „cât de diferit spui de obicei aceeași comandă”.
-    Pragul = REJECT_FACTOR × mediana."""
-    same_class = []
-    for i, (action_i, _, feats_i) in enumerate(templates):
-        distances = [
-            dtw_distance(feats_i, feats_j)
-            for j, (action_j, _, feats_j) in enumerate(templates)
-            if j != i and action_j == action_i
-        ]
-        if distances:
-            same_class.append(min(distances))
-    if not same_class:
-        return None  # prea puține șabloane: nu respingem nimic
-    return float(REJECT_FACTOR * np.median(same_class))
+    print(f"[dtw] {len(templates)} templates {template_counts()}, threshold={threshold}", flush=True)
 
 
 def template_counts():
-    counts = {}
-    for action, _, _ in _templates:
-        counts[action] = counts.get(action, 0) + 1
-    return counts
+    return dict(Counter(action for action, _ in templates))
 
-
-def has_templates():
-    return len(_templates) > 0
-
-
-# ======================================================================
-# Recunoașterea
-# ======================================================================
 
 def recognize(clean_signal):
-    """Semnal preprocesat -> {"action", "distance", "threshold", "scores"}
+    """Semnal preprocesat -> {"action", "distance", "scores"}."""
+    if len(clean_signal) / SAMPLE_RATE > MAX_SECONDS:
+        return {"action": "unknown", "distance": None, "scores": {}}
 
-    scores = cea mai mică distanță DTW pentru fiecare comandă
-             (utile în documentație: cât de „sigur” e clasificatorul)."""
-    with _lock:
-        templates, threshold = _templates, _threshold
+    query = features_of(clean_signal)
 
-    if len(clean_signal) / SAMPLE_RATE > MAX_COMMAND_SECONDS:
-        return {"action": "unknown", "distance": None, "threshold": threshold, "scores": {}}
-
-    query = extract_features(clean_signal)
-
+    # scores[comanda] = distanța până la cel mai apropiat șablon al ei
     scores = {}
-    for action, _, feats in templates:
+    for action, feats in templates:
         distance = dtw_distance(query, feats)
-        if action not in scores or distance < scores[action]:
-            scores[action] = distance
+        scores[action] = min(distance, scores.get(action, np.inf))
 
-    best_action = min(scores, key=scores.get)
-    best_distance = scores[best_action]
-
-    if threshold is not None and best_distance > threshold:
-        best_action = "unknown"
+    best = min(scores, key=scores.get)
+    if threshold is not None and scores[best] > threshold:
+        best = "unknown"
 
     return {
-        "action": best_action,
-        "distance": round(float(best_distance), 3),
-        "threshold": None if threshold is None else round(threshold, 3),
-        "scores": {a: round(float(d), 3) for a, d in sorted(scores.items(), key=lambda x: x[1])},
+        "action": best,
+        "distance": round(min(scores.values()), 3),
+        "scores": {a: round(d, 3) for a, d in sorted(scores.items(), key=lambda x: x[1])},
     }

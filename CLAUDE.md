@@ -95,7 +95,7 @@ Totul rulează cu `docker compose up`, cu patru servicii:
    - eliminarea componentei DC
    - **VAD (energie + ZCR):** pe cadre de 25 ms cu pas de 10 ms se calculează **energia pe termen scurt** (dB) și **zero-crossing rate**. Pragurile sunt adaptive: zgomotul de fond e percentila 10 a energiei, pragul de jos e zgomot + 6 dB, iar cel de sus zgomot + 12 dB.
      - Un cadru e vorbire dacă energia > pragul de sus, SAU energia > pragul de jos și ZCR > 0.25 (consoane fricative).
-     - Decizia se netezește: pauzele < 200 ms se umplu, iar zonele < 100 ms se elimină.
+     - E vorbire doar dacă există cel puțin 10 cadre de vorbire (100 ms). Așa se resping clicurile.
      - Se taie liniștea, cu o margine de 150 ms. Cu 50 ms, în zgomot, VAD-ul tăia finalul cuvintelor slabe, iar Whisper scădea de la 87% la 80% pe setul sintetic. Dacă nu rămâne vorbire, Whisper nu mai rulează și răspunsul e `unknown`.
    - normalizarea amplitudinii (vârf 0.95)
    - **pre-emphasis** (`y[n] = x[n] - 0.97·x[n-1]`) se aplică **doar pe ramura MFCC/DTW** și în spectrogramă, nu înainte de Whisper. Whisper a fost antrenat pe vorbire naturală și își calculează singur spectrograma log-Mel.
@@ -175,7 +175,7 @@ Un script separat, `evaluation/evaluate.py`, care rulează pe un set de înregis
 - o **matrice de confuzie** și grafice (PNG) în `evaluation/results/`
 
 Implementare: rulează în containerul `speech` (`docker compose exec speech python /evaluation/evaluate.py`, opțional `--methods dtw`). Produce:
-- `results.csv` și `summary.csv`
+- `results.csv`
 - `summary.md`, cu tabelul gata de copiat în documentație
 - graficele `accuracy.png`, `processing_time.png` și `confusion_<metoda>_<conditie>.png`
 
@@ -235,6 +235,10 @@ utter&butter/
 ```
 
 ## 10. Reguli de lucru pentru Claude Code
+- **Codul trebuie să rămână simplu** (refactorizat pe 15 nov 2026 pentru un începător):
+  - funcții scurte, fără abstracții inutile
+  - în frontend, butoanele folosesc `data-action` și un singur handler de click
+  - în backend, erorile de validare sunt `ValueError`, transformate automat în 400
 - Lucrăm **incremental**, în pași mici care se pot testa. Ordinea:
   1. `docker-compose` cu `db` + `api` + `web` și o pagină simplă
   2. CRUD rețete: Home + formular

@@ -1,232 +1,119 @@
 """
-Serviciul `api`: backend-ul pentru rețete (CRUD = Create, Read, Update, Delete).
+Serviciul `api`: rețetele (adăugare, citire, editare, ștergere).
 
-  GET    /api/recipes        -> lista tuturor rețetelor (fără pași)
-  GET    /api/recipes/<id>   -> o rețetă completă, cu ingrediente și pași
-  POST   /api/recipes        -> adaugă o rețetă nouă
-  PUT    /api/recipes/<id>   -> modifică o rețetă existentă
-  DELETE /api/recipes/<id>   -> șterge o rețetă
+  GET    /api/recipes        lista rețetelor
+  GET    /api/recipes/<id>   o rețetă completă, cu ingrediente și pași
+  POST   /api/recipes        rețetă nouă
+  PUT    /api/recipes/<id>   modifică o rețetă
+  DELETE /api/recipes/<id>   șterge o rețetă
 
-Formatul JSON al unei rețete (la POST și PUT):
-{
-  "title": "Pancakes",
-  "servings": 4,
-  "total_minutes": 30,
-  "ingredients": ["2 eggs", "500 ml milk"],
-  "steps": [
-    {"text": "Whisk the eggs...", "timer_minutes": null},
-    {"text": "Let it rest.",       "timer_minutes": 10}
-  ]
-}
+O rețetă în JSON:
+  {"title": "Pancakes", "servings": 4, "total_minutes": 30,
+   "ingredients": ["2 eggs", "500 ml milk"],
+   "steps": [{"text": "Whisk the eggs", "timer_minutes": null}, ...]}
 """
 
 import os
 
 import psycopg
-from psycopg.rows import dict_row
 from flask import Flask, jsonify, request
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
-
-# Adresa bazei de date vine din docker-compose.yml (variabilă de mediu).
-# "db" este numele serviciului Postgres în rețeaua Docker.
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://butter:butter@db:5432/utterbutter"
-)
+DATABASE_URL = os.environ["DATABASE_URL"]   # vine din docker-compose.yml
 
 
-def get_connection():
-    """Deschide o conexiune nouă la Postgres.
-    row_factory=dict_row => fiecare rând vine ca dicționar {coloana: valoare},
-    deci îl putem transforma direct în JSON.
-    Folosită cu `with`, conexiunea face COMMIT automat la final
-    (sau ROLLBACK dacă apare o eroare)."""
+def connect():
+    """Conexiune la Postgres. dict_row = fiecare rând vine ca dicționar (ușor de trimis ca JSON).
+    Folosită cu `with`, salvează automat modificările la final (COMMIT)."""
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
-# ---------------------------------------------------------------------
-# Funcții ajutătoare
-# ---------------------------------------------------------------------
-
-def to_positive_int(value, default):
-    """Transformă o valoare în număr întreg >= 0. Dacă nu se poate, întoarce default."""
-    try:
-        number = int(value)
-        return number if number >= 0 else default
-    except (TypeError, ValueError):
-        return default
-
-
-def validate_recipe(data):
-    """Verifică și curăță datele primite de la formular.
-    Întoarce (recipe, None) dacă e totul în regulă, sau (None, mesaj_eroare)."""
-    if not isinstance(data, dict):
-        return None, "Invalid JSON"
-
-    title = str(data.get("title", "")).strip()
-    if not title:
-        return None, "The recipe needs a title"
-
-    # Păstrăm doar ingredientele care nu sunt goale
-    ingredients = [
-        str(item).strip() for item in data.get("ingredients", []) if str(item).strip()
-    ]
-
-    # Păstrăm doar pașii cu text; timer-ul e opțional (None = fără timer)
-    steps = []
-    for step in data.get("steps", []):
-        if not isinstance(step, dict):
-            continue
-        text = str(step.get("text", "")).strip()
-        if not text:
-            continue
-        timer = to_positive_int(step.get("timer_minutes"), None)
-        if timer == 0:
-            timer = None
-        steps.append({"text": text, "timer_minutes": timer})
-
-    if not steps:
-        return None, "The recipe needs at least one step"
-
+def read_recipe_from_request():
+    """Citește rețeta trimisă de formular și elimină câmpurile goale."""
+    data = request.get_json()
     recipe = {
-        "title": title,
-        "servings": to_positive_int(data.get("servings"), 1) or 1,
-        "total_minutes": to_positive_int(data.get("total_minutes"), 0),
-        "ingredients": ingredients,
-        "steps": steps,
+        "title": data.get("title", "").strip(),
+        "servings": int(data.get("servings") or 1),
+        "total_minutes": int(data.get("total_minutes") or 0),
+        "ingredients": [i.strip() for i in data.get("ingredients", []) if i.strip()],
+        "steps": [{"text": s["text"].strip(), "timer_minutes": s.get("timer_minutes") or None}
+                  for s in data.get("steps", []) if s.get("text", "").strip()],
     }
-    return recipe, None
+    if not recipe["title"] or not recipe["steps"]:
+        raise ValueError("The recipe needs a title and at least one step")
+    return recipe
 
 
-def save_ingredients_and_steps(conn, recipe_id, recipe):
-    """Scrie ingredientele și pașii unei rețete, în ordine (position = 1, 2, 3...)."""
+def save_ingredients_and_steps(db, recipe_id, recipe):
+    # position = 1, 2, 3... păstrează ordinea
     for position, text in enumerate(recipe["ingredients"], start=1):
-        conn.execute(
-            "INSERT INTO ingredients (recipe_id, position, text) VALUES (%s, %s, %s)",
-            (recipe_id, position, text),
-        )
+        db.execute("INSERT INTO ingredients (recipe_id, position, text) VALUES (%s, %s, %s)",
+                   (recipe_id, position, text))
     for position, step in enumerate(recipe["steps"], start=1):
-        conn.execute(
-            """
-            INSERT INTO steps (recipe_id, position, text, timer_minutes)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (recipe_id, position, step["text"], step["timer_minutes"]),
-        )
-
-
-# ---------------------------------------------------------------------
-# Rute (endpoint-uri)
-# ---------------------------------------------------------------------
-
-@app.get("/api/health")
-def health():
-    """Verificare rapidă că serverul merge (utilă la depanare)."""
-    return jsonify({"status": "ok"})
+        db.execute("INSERT INTO steps (recipe_id, position, text, timer_minutes) VALUES (%s, %s, %s, %s)",
+                   (recipe_id, position, step["text"], step["timer_minutes"]))
 
 
 @app.get("/api/recipes")
 def list_recipes():
-    """Întoarce toate rețetele, cele mai vechi primele."""
-    with get_connection() as conn:
-        recipes = conn.execute(
-            """
-            SELECT id, title, servings, total_minutes
-            FROM recipes
-            ORDER BY id
-            """
-        ).fetchall()
+    with connect() as db:
+        recipes = db.execute("SELECT id, title, servings, total_minutes FROM recipes ORDER BY id").fetchall()
     return jsonify(recipes)
 
 
 @app.get("/api/recipes/<int:recipe_id>")
 def get_recipe(recipe_id):
-    """Întoarce o rețetă completă: datele ei + ingrediente + pași."""
-    with get_connection() as conn:
-        # %s este un „loc liber” completat sigur de psycopg (fără SQL injection)
-        recipe = conn.execute(
-            "SELECT id, title, servings, total_minutes FROM recipes WHERE id = %s",
-            (recipe_id,),
-        ).fetchone()
-
+    with connect() as db:
+        # %s = loc completat de psycopg (sigur, fără SQL injection)
+        recipe = db.execute("SELECT id, title, servings, total_minutes FROM recipes WHERE id = %s",
+                            (recipe_id,)).fetchone()
         if recipe is None:
-            return jsonify({"error": "Recipe not found"}), 404
+            return {"error": "Recipe not found"}, 404
+        ingredients = db.execute("SELECT text FROM ingredients WHERE recipe_id = %s ORDER BY position",
+                                 (recipe_id,)).fetchall()
+        steps = db.execute("SELECT text, timer_minutes FROM steps WHERE recipe_id = %s ORDER BY position",
+                           (recipe_id,)).fetchall()
 
-        ingredients = conn.execute(
-            "SELECT text FROM ingredients WHERE recipe_id = %s ORDER BY position",
-            (recipe_id,),
-        ).fetchall()
-
-        steps = conn.execute(
-            """
-            SELECT text, timer_minutes
-            FROM steps
-            WHERE recipe_id = %s
-            ORDER BY position
-            """,
-            (recipe_id,),
-        ).fetchall()
-
-    # Ingredientele le trimitem ca listă simplă de texte: ["2 eggs", ...]
     recipe["ingredients"] = [row["text"] for row in ingredients]
     recipe["steps"] = steps
-    return jsonify(recipe)
+    return recipe
 
 
 @app.post("/api/recipes")
 def create_recipe():
-    """Adaugă o rețetă nouă și întoarce id-ul ei."""
-    recipe, error = validate_recipe(request.get_json(silent=True))
-    if error:
-        return jsonify({"error": error}), 400
-
-    with get_connection() as conn:
-        # RETURNING id = Postgres ne spune ce id a generat
-        row = conn.execute(
-            """
-            INSERT INTO recipes (title, servings, total_minutes)
-            VALUES (%s, %s, %s)
-            RETURNING id
-            """,
+    recipe = read_recipe_from_request()
+    with connect() as db:
+        new_id = db.execute(
+            "INSERT INTO recipes (title, servings, total_minutes) VALUES (%s, %s, %s) RETURNING id",
             (recipe["title"], recipe["servings"], recipe["total_minutes"]),
-        ).fetchone()
-        save_ingredients_and_steps(conn, row["id"], recipe)
-
-    return jsonify({"id": row["id"]}), 201
+        ).fetchone()["id"]
+        save_ingredients_and_steps(db, new_id, recipe)
+    return {"id": new_id}, 201
 
 
 @app.put("/api/recipes/<int:recipe_id>")
 def update_recipe(recipe_id):
-    """Modifică o rețetă. Cel mai simplu mod: actualizăm datele de bază,
-    ștergem vechile ingrediente și pași, apoi îi scriem pe cei noi."""
-    recipe, error = validate_recipe(request.get_json(silent=True))
-    if error:
-        return jsonify({"error": error}), 400
-
-    with get_connection() as conn:
-        result = conn.execute(
-            """
-            UPDATE recipes
-            SET title = %s, servings = %s, total_minutes = %s
-            WHERE id = %s
-            """,
-            (recipe["title"], recipe["servings"], recipe["total_minutes"], recipe_id),
-        )
-        if result.rowcount == 0:
-            return jsonify({"error": "Recipe not found"}), 404
-
-        conn.execute("DELETE FROM ingredients WHERE recipe_id = %s", (recipe_id,))
-        conn.execute("DELETE FROM steps WHERE recipe_id = %s", (recipe_id,))
-        save_ingredients_and_steps(conn, recipe_id, recipe)
-
-    return jsonify({"id": recipe_id})
+    """Cel mai simplu mod de a edita: actualizăm titlul etc.,
+    ștergem ingredientele și pașii vechi, apoi îi scriem pe cei noi."""
+    recipe = read_recipe_from_request()
+    with connect() as db:
+        db.execute("UPDATE recipes SET title = %s, servings = %s, total_minutes = %s WHERE id = %s",
+                   (recipe["title"], recipe["servings"], recipe["total_minutes"], recipe_id))
+        db.execute("DELETE FROM ingredients WHERE recipe_id = %s", (recipe_id,))
+        db.execute("DELETE FROM steps WHERE recipe_id = %s", (recipe_id,))
+        save_ingredients_and_steps(db, recipe_id, recipe)
+    return {"id": recipe_id}
 
 
 @app.delete("/api/recipes/<int:recipe_id>")
 def delete_recipe(recipe_id):
-    """Șterge o rețetă. Ingredientele și pașii se șterg automat (ON DELETE CASCADE)."""
-    with get_connection() as conn:
-        result = conn.execute("DELETE FROM recipes WHERE id = %s", (recipe_id,))
-        if result.rowcount == 0:
-            return jsonify({"error": "Recipe not found"}), 404
+    # ingredientele și pașii se șterg automat (ON DELETE CASCADE în init.sql)
+    with connect() as db:
+        db.execute("DELETE FROM recipes WHERE id = %s", (recipe_id,))
     return "", 204
+
+
+@app.errorhandler(ValueError)
+def bad_request(error):
+    return {"error": str(error)}, 400

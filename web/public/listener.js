@@ -1,105 +1,76 @@
-// listener.js: ascultare continuă la microfon („always listening”).
+// listener.js: microfonul ascultă continuu și trimite fiecare frază la server.
 //
-// Ce face:
-//   1. citește continuu sunetul de la microfon, în bucăți mici (~40 ms);
-//   2. pentru fiecare bucată calculează nivelul (RMS) și îl compară cu un prag
-//      care se adaptează la zgomotul de fond din cameră;
-//   3. când nivelul trece de prag, începe un „segment” (cineva vorbește);
-//      păstrăm și ~300 ms dinainte, ca să nu pierdem începutul cuvântului;
-//   4. după ~700 ms de liniște (sau maximum 5 s) segmentul se închide;
-//   5. segmentul e convertit la 16 kHz, WAV, 16 biți, și trimis la serviciul `speech`.
+// 1. Citim sunetul de la microfon în bucăți mici (~40 ms).
+// 2. Pentru fiecare bucată calculăm nivelul (RMS) și îl comparăm cu un prag.
+// 3. Nivel peste prag = începe o frază. ~700 ms de liniște = fraza s-a terminat.
+// 4. Fraza e convertită în WAV (16 kHz, 16 biți) și trimisă la serviciul `speech`.
 //
-// Atenție: aici e doar o segmentare GROSIERĂ, ca să știm ce bucăți trimitem.
-// VAD-ul „adevărat” (energie + ZCR) și toată prelucrarea se fac în Python.
+// Aici facem doar o tăiere grosieră. Prelucrarea „adevărată” (VAD cu energie + ZCR) e în Python.
 
 const Listener = (() => {
-  // ---------------- Parametri (se pot regla) ----------------
-  const TARGET_RATE = 16000;     // Hz: ce așteaptă serverul
-  const BUFFER_SIZE = 2048;      // eșantioane per bucată (~43 ms la 48 kHz)
-  const PRE_ROLL_MS = 300;       // cât păstrăm dinainte de începutul vorbirii
-  const END_SILENCE_MS = 700;    // câtă liniște închide un segment
-  const MAX_SEGMENT_MS = 5000;   // lungimea maximă a unui segment
-  const MIN_SPEECH_MS = 200;     // segmente mai scurte = zgomot (clic, tuse), le ignorăm
-  const MIN_THRESHOLD = 0.012;   // pragul minim absolut de RMS
-  const NOISE_FACTOR = 3;        // pragul = de 3 ori nivelul zgomotului de fond
-  const TTS_COOLDOWN_MS = 600;   // după ce aplicația termină de vorbit, mai așteptăm puțin
+  const PRE_ROLL_MS = 300;       // păstrăm și 300 ms dinainte, ca să nu pierdem începutul cuvântului
+  const END_SILENCE_MS = 700;    // atâta liniște închide fraza
+  const MAX_PHRASE_MS = 5000;    // o frază are cel mult 5 secunde
+  const MIN_SPEECH_MS = 200;     // mai puțin = un clic sau o tuse, o ignorăm
 
-  // ---------------- Starea ----------------
-  let session = 0;               // crește la fiecare start/stop (vezi start())
-  let callbacks = null;          // { onState, onResult, onError }
-  let stream = null, audioContext = null, source = null, processor = null;
+  // ?method=dtw în adresă = folosim metoda MFCC + DTW în loc de Whisper
+  const METHOD = new URLSearchParams(location.search).get("method") === "dtw" ? "dtw" : "whisper";
 
-  let inSpeech = false;          // suntem în mijlocul unui segment?
-  let segment = [];              // bucățile segmentului curent
-  let preRoll = [];              // ultimele bucăți dinaintea vorbirii
-  let silenceMs = 0, speechMs = 0;
-  let noiseLevel = 0.005;        // estimarea zgomotului de fond (se actualizează)
-
+  let callbacks = null;          // { onState, onResult, onError, onSegment } de la pagina care ascultă
+  let stream = null;             // microfonul
+  let audioContext = null;
+  let muted = false;
   let busy = false;              // așteptăm răspunsul serverului
-  let muted = false;             // utilizatorul a oprit ascultarea
-  let ttsUntil = 0;              // până când ignorăm microfonul după text-to-speech
-  let currentState = "off";
+  let pausedUntil = 0;           // după ce aplicația a vorbit, mai așteptăm puțin
+  let currentState = "";
 
-  // ------------------------------------------------------------------
-  // Pornire / oprire
-  // ------------------------------------------------------------------
+  // Starea frazei curente
+  let chunks = [];               // bucățile de sunet adunate
+  let speaking = false;          // suntem în mijlocul unei fraze?
+  let speechMs = 0;
+  let silenceMs = 0;
+  let noiseLevel = 0.005;        // zgomotul de fond, se adaptează la cameră
 
   async function start(newCallbacks) {
     stop();
-    const mySession = ++session;
     callbacks = newCallbacks;
+    currentState = "";
+    const myCallbacks = callbacks;
     setState("processing", "Starting mic…");
 
-    let micStream;
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,   // reduce sunetul propriu (alarma, vocea aplicației)
-          noiseSuppression: false,  // filtrarea zgomotului o facem noi, în Python
-          autoGainControl: true,
-        },
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: false },
       });
-    } catch (error) {
-      if (mySession === session) setState("error", "Mic blocked");
+    } catch {
+      setState("error", "Mic blocked");
+      return;
+    }
+    if (callbacks !== myCallbacks) {          // între timp am ieșit din pagină
+      stream.getTracks().forEach((track) => track.stop());
       return;
     }
 
-    // Dacă între timp utilizatorul a ieșit din pagină, renunțăm
-    if (mySession !== session) {
-      micStream.getTracks().forEach((t) => t.stop());
-      return;
-    }
-
-    stream = micStream;
     audioContext = new AudioContext();
-    source = audioContext.createMediaStreamSource(stream);
-
-    // ScriptProcessorNode: cea mai simplă metodă de a primi eșantioanele în JS.
-    // (E marcată „deprecated”, dar e suportată de toate browserele și e ușor de înțeles.)
-    processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-    processor.onaudioprocess = (event) => onAudio(event.inputBuffer.getChannelData(0));
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(2048, 1, 1);   // ne dă bucăți de 2048 eșantioane
+    processor.onaudioprocess = (event) => onChunk(new Float32Array(event.inputBuffer.getChannelData(0)));
     source.connect(processor);
-    processor.connect(audioContext.destination); // necesar ca să ruleze; ieșirea e liniște
+    processor.connect(audioContext.destination);
 
     if (audioContext.state === "suspended") {
-      // Browserul cere un click înainte de a porni sunetul (ex: după refresh)
-      setState("paused", "Click to start listening");
+      setState("paused", "Click to start listening");   // browserul vrea un click înainte de sunet
     } else {
       setState("listening", "Listening");
     }
   }
 
   function stop() {
-    session++;
-    if (processor) processor.disconnect();
-    if (source) source.disconnect();
     if (stream) stream.getTracks().forEach((track) => track.stop());
     if (audioContext) audioContext.close();
-    processor = source = stream = audioContext = null;
-    callbacks = null;
+    stream = audioContext = callbacks = null;
     busy = false;
-    resetSegment();
+    resetPhrase();
   }
 
   // Click pe indicatorul de microfon: pornește sunetul sau comută mute
@@ -111,56 +82,45 @@ const Listener = (() => {
     } else {
       muted = !muted;
     }
-    resetSegment();
+    resetPhrase();
     setState(muted ? "paused" : "listening", muted ? "Muted · click to listen" : "Listening");
   }
 
-  // ------------------------------------------------------------------
-  // Prelucrarea fiecărei bucăți de sunet
-  // ------------------------------------------------------------------
+  function resetPhrase() {
+    chunks = [];
+    speaking = false;
+    speechMs = 0;
+    silenceMs = 0;
+  }
 
-  function onAudio(input) {
-    if (!audioContext || muted || busy || audioContext.state !== "running") return;
+  // Apelată pentru fiecare bucată de sunet (~40 ms)
+  function onChunk(chunk) {
+    if (muted || busy || audioContext.state !== "running") return;
 
-    // Cât timp aplicația vorbește (text-to-speech), nu ascultăm
-    // (altfel s-ar auzi pe ea însăși și ar executa comenzi).
-    if (window.speechSynthesis && (speechSynthesis.speaking || speechSynthesis.pending)) {
-      ttsUntil = performance.now() + TTS_COOLDOWN_MS;
-    }
-    if (performance.now() < ttsUntil) {
-      resetSegment();
-      if (currentState !== "paused") setState("paused", "Paused while reading");
+    // Cât timp aplicația citește cu voce (+ încă 600 ms), nu ascultăm: s-ar auzi pe ea însăși
+    if (speechSynthesis.speaking) pausedUntil = performance.now() + 600;
+    if (performance.now() < pausedUntil) {
+      resetPhrase();
+      setState("paused", "Paused while reading");
       return;
     }
-    if (currentState !== "listening") setState("listening", "Listening");
+    setState("listening", "Listening");
 
-    // Copiem bucata (browserul refolosește același buffer)
-    const chunk = new Float32Array(input);
     const chunkMs = (chunk.length / audioContext.sampleRate) * 1000;
     const level = rms(chunk);
-    const threshold = Math.max(MIN_THRESHOLD, noiseLevel * NOISE_FACTOR);
+    const threshold = Math.max(0.012, noiseLevel * 3);
+    chunks.push(chunk);
 
-    if (!inSpeech) {
-      // Păstrăm ultimele ~300 ms (pre-roll)
-      preRoll.push(chunk);
-      while (preRoll.length * chunkMs > PRE_ROLL_MS) preRoll.shift();
-
+    if (!speaking) {
       if (level > threshold) {
-        // Începe vorbirea
-        inSpeech = true;
-        segment = preRoll;
-        preRoll = [];
-        speechMs = chunkMs;
-        silenceMs = 0;
+        speaking = true;                                      // începe o frază
       } else {
-        // Liniște: actualizăm lent estimarea zgomotului de fond (medie exponențială)
-        noiseLevel = 0.95 * noiseLevel + 0.05 * level;
+        noiseLevel = 0.95 * noiseLevel + 0.05 * level;        // învățăm zgomotul de fond
+        while (chunks.length * chunkMs > PRE_ROLL_MS) chunks.shift();
+        return;
       }
-      return;
     }
 
-    // Suntem într-un segment
-    segment.push(chunk);
     if (level > threshold) {
       speechMs += chunkMs;
       silenceMs = 0;
@@ -168,151 +128,106 @@ const Listener = (() => {
       silenceMs += chunkMs;
     }
 
-    const totalMs = segment.length * chunkMs;
-    if (silenceMs >= END_SILENCE_MS || totalMs >= MAX_SEGMENT_MS) {
+    const phraseEnded = silenceMs >= END_SILENCE_MS || chunks.length * chunkMs >= MAX_PHRASE_MS;
+    if (phraseEnded) {
       const enoughSpeech = speechMs >= MIN_SPEECH_MS;
-      const samples = concat(segment);
-      const rate = audioContext.sampleRate;
-      resetSegment();
-      if (enoughSpeech) send(samples, rate);
+      const samples = joinChunks(chunks);
+      const sampleRate = audioContext.sampleRate;
+      resetPhrase();
+      if (enoughSpeech) send(toWav(downsample(samples, sampleRate, 16000), 16000));
     }
   }
 
-  function resetSegment() {
-    inSpeech = false;
-    segment = [];
-    preRoll = [];
-    silenceMs = 0;
-    speechMs = 0;
-  }
-
-  // ------------------------------------------------------------------
-  // Trimiterea la server
-  // ------------------------------------------------------------------
-
-  // Metoda de recunoaștere: implicit Whisper. Pentru demo, adresa
-  // http://localhost:8090/?method=dtw#/cook/1 folosește MFCC + DTW.
-  const METHOD = new URLSearchParams(location.search).get("method") === "dtw" ? "dtw" : "whisper";
-
-  async function send(samples, sampleRate) {
-    const mySession = session;
+  async function send(wav) {
+    const myCallbacks = callbacks;
     busy = true;
     setState("processing", "Thinking…");
 
-    const wav = encodeWav(downsample(samples, sampleRate, TARGET_RATE), TARGET_RATE);
-
-    // Pagina de înregistrare (#/record) vrea fișierul WAV, nu o comandă
-    if (callbacks?.onSegment) {
-      try {
-        await callbacks.onSegment(wav);
-      } finally {
-        if (mySession === session) {
-          busy = false;
-          setState("listening", "Listening");
-        }
-      }
-      return;
-    }
-
     try {
-      const form = new FormData();
-      form.append("audio", wav, "command.wav");
-
-      const response = await fetch(`/api/command?method=${METHOD}`, { method: "POST", body: form });
-      const data = await response.json().catch(() => ({}));
-      if (mySession !== session) return; // am ieșit din pagină între timp
-
-      if (response.status === 503) {
-        callbacks?.onError?.("Speech model is still loading…");
-      } else if (!response.ok) {
-        callbacks?.onError?.(data.error || "Server error " + response.status);
+      if (callbacks.onSegment) {
+        await callbacks.onSegment(wav);       // pagina #/record vrea doar fișierul
       } else {
-        callbacks?.onResult?.(data);
+        const form = new FormData();
+        form.append("audio", wav, "command.wav");
+        const response = await fetch(`/api/command?method=${METHOD}`, { method: "POST", body: form });
+        const data = await response.json();
+        if (callbacks !== myCallbacks) return;            // am ieșit din pagină între timp
+        if (response.ok) callbacks.onResult(data);
+        else callbacks.onError(data.error || "Server error");
       }
-    } catch (error) {
-      if (mySession === session) callbacks?.onError?.("Cannot reach the speech server");
+    } catch {
+      if (callbacks === myCallbacks) callbacks.onError("Cannot reach the speech server");
     } finally {
-      if (mySession === session) {
-        busy = false;
-        setState("listening", "Listening");
-      }
+      if (callbacks === myCallbacks) busy = false;
     }
   }
 
   function setState(state, label) {
-    currentState = state;
-    callbacks?.onState?.(state, label);
+    if (!callbacks || label === currentState) return;   // anunțăm pagina doar când se schimbă ceva
+    currentState = label;
+    callbacks.onState(state, label);
   }
 
   // ------------------------------------------------------------------
-  // Prelucrări de semnal simple
+  // Prelucrări simple de semnal
   // ------------------------------------------------------------------
 
-  // RMS (Root Mean Square) = rădăcina din media pătratelor = „nivelul” sunetului
+  // RMS = rădăcina din media pătratelor = „cât de tare” e sunetul
   function rms(samples) {
     let sum = 0;
-    for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+    for (const s of samples) sum += s * s;
     return Math.sqrt(sum / samples.length);
   }
 
-  // Lipește mai multe bucăți într-un singur vector
-  function concat(chunks) {
-    const total = chunks.reduce((n, c) => n + c.length, 0);
-    const result = new Float32Array(total);
+  function joinChunks(list) {
+    const result = new Float32Array(list.reduce((n, c) => n + c.length, 0));
     let offset = 0;
-    for (const c of chunks) {
+    for (const c of list) {
       result.set(c, offset);
       offset += c.length;
     }
     return result;
   }
 
-  // Reeșantionare de la frecvența microfonului (de obicei 48 kHz) la 16 kHz.
-  // Fiecare eșantion nou = media eșantioanelor vechi din intervalul lui.
-  // Media acționează ca un filtru trece-jos simplu (reduce aliasing-ul).
+  // 48 kHz -> 16 kHz: fiecare eșantion nou = media a 3 eșantioane vechi.
+  // Media lucrează și ca un filtru trece-jos simplu.
   function downsample(samples, fromRate, toRate) {
-    if (fromRate === toRate) return samples;
     const ratio = fromRate / toRate;
-    const length = Math.floor(samples.length / ratio);
-    const result = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
+    const result = new Float32Array(Math.floor(samples.length / ratio));
+    for (let i = 0; i < result.length; i++) {
       const start = Math.floor(i * ratio);
-      const end = Math.min(Math.floor((i + 1) * ratio), samples.length);
+      const end = Math.floor((i + 1) * ratio);
       let sum = 0;
       for (let j = start; j < end; j++) sum += samples[j];
-      result[i] = sum / Math.max(1, end - start);
+      result[i] = sum / (end - start);
     }
     return result;
   }
 
-  // Construiește un fișier WAV: antet de 44 de octeți + eșantioane pe 16 biți
-  function encodeWav(samples, sampleRate) {
-    const buffer = new ArrayBuffer(44 + samples.length * 2);
-    const view = new DataView(buffer);
-    const writeText = (offset, text) => {
-      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
-    };
+  // Fișier WAV = antet de 44 de octeți + eșantioanele ca întregi pe 16 biți
+  function toWav(samples, sampleRate) {
+    const view = new DataView(new ArrayBuffer(44 + samples.length * 2));
+    const text = (offset, str) => [...str].forEach((ch, i) => view.setUint8(offset + i, ch.charCodeAt(0)));
 
-    writeText(0, "RIFF");
-    view.setUint32(4, 36 + samples.length * 2, true); // mărimea fișierului - 8
-    writeText(8, "WAVE");
-    writeText(12, "fmt ");
+    text(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    text(8, "WAVE");
+    text(12, "fmt ");
     view.setUint32(16, 16, true);              // mărimea blocului „fmt”
     view.setUint16(20, 1, true);               // 1 = PCM (necomprimat)
     view.setUint16(22, 1, true);               // 1 canal (mono)
     view.setUint32(24, sampleRate, true);      // eșantioane pe secundă
     view.setUint32(28, sampleRate * 2, true);  // octeți pe secundă
-    view.setUint16(32, 2, true);               // octeți per eșantion
-    view.setUint16(34, 16, true);              // biți per eșantion
-    writeText(36, "data");
+    view.setUint16(32, 2, true);               // octeți pe eșantion
+    view.setUint16(34, 16, true);              // biți pe eșantion
+    text(36, "data");
     view.setUint32(40, samples.length * 2, true);
 
-    // Float [-1, 1] -> întreg pe 16 biți [-32768, 32767]
-    for (let i = 0; i < samples.length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-    return new Blob([buffer], { type: "audio/wav" });
+    samples.forEach((s, i) => {
+      const clipped = Math.max(-1, Math.min(1, s));
+      view.setInt16(44 + i * 2, clipped * 32767, true);   // [-1, 1] -> [-32767, 32767]
+    });
+    return new Blob([view], { type: "audio/wav" });
   }
 
   return { start, stop, toggle };

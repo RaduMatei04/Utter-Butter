@@ -1,223 +1,169 @@
-// recorder.js: pagina #/record, unealtă pentru înregistrarea vocii tale.
+// recorder.js: pagina #/record, pentru înregistrarea vocii tale.
 //
-//   - Templates (DTW): 3–5 exemple pentru fiecare comandă, folosite de metoda MFCC + DTW
-//                      -> salvate în speech/templates_audio/<comanda>/
-//   - Test set:        înregistrări etichetate pentru evaluate.py (pasul 7),
-//                      în liniște sau cu zgomot de fond
-//                      -> salvate în evaluation/data/<conditie>/<comanda>/
+//   Templates  -> șabloanele metodei MFCC + DTW     (speech/templates_audio/<comanda>/)
+//   Test set   -> înregistrări pentru evaluate.py   (evaluation/data/<quiet|noise>/<comanda>/)
 //
-// Microfonul ascultă continuu (același listener.js ca la gătit). Când apeși
-// „Record 5” la o comandă, următoarele 5 fraze spuse se salvează pentru ea.
+// Microfonul ascultă continuu (listener.js). Apeși „Record 5” la o comandă,
+// iar următoarele 5 fraze spuse se salvează pentru ea.
 
 const Recorder = (() => {
-  // Ce trebuie spus pentru fiecare comandă (engleză / română)
-  const PHRASES = [
-    ["next", "next step", "pasul următor"],
-    ["previous", "go back", "înapoi"],
-    ["repeat", "repeat", "repetă"],
-    ["read", "read", "citește"],
-    ["ingredients", "ingredients", "ingrediente"],
-    ["close", "close", "închide"],
-    ["timer", "start timer", "pornește timer"],
-    ["stop_timer", "stop timer", "oprește timer"],
-    ["help", "help", "ajutor"],
-    ["exit", "exit", "ieșire"],
+  // [comanda, ce spui în engleză, ce spui în română]
+  const COMMANDS = [
+    ["next", "next step", "pasul următor"], ["previous", "go back", "înapoi"],
+    ["repeat", "repeat", "repetă"], ["read", "read", "citește"],
+    ["ingredients", "ingredients", "ingrediente"], ["close", "close", "închide"],
+    ["timer", "start timer", "pornește timer"], ["stop_timer", "stop timer", "oprește timer"],
+    ["help", "help", "ajutor"], ["exit", "exit", "ieșire"],
   ];
-  // În setul de test, timer-ul se spune cu un număr (testăm și extragerea valorii)
-  const TEST_TIMER_PHRASE = ["start timer five minutes", "pornește timer cinci minute"];
-  const TAKES = 5; // câte înregistrări la un click
+  const TAKES = 5;
 
   let root = null;
-  let setName = "templates";   // "templates" sau "test"
-  let condition = "quiet";     // "quiet" sau "noise" (doar pentru test)
-  let armedAction = null;      // comanda pentru care înregistrăm acum
-  let remaining = 0;           // câte înregistrări mai sunt de făcut
-  let counts = {};
+  let set = "templates";       // "templates" sau "test"
+  let condition = "quiet";     // "quiet" sau "noise" (doar pentru setul de test)
+  let recording = null;        // comanda pe care o înregistrăm acum
+  let left = 0;                // câte fraze mai sunt de spus
+  let counts = {};             // câte înregistrări are fiecare comandă
 
-  // Fraza în engleză pentru o comandă (pentru mesajele de stare)
-  function phraseFor(action) {
-    if (setName === "test" && action === "timer") return TEST_TIMER_PHRASE[0];
-    return PHRASES.find(([a]) => a === action)[1];
+  // În setul de test, timer-ul se spune cu un număr (testăm și extragerea lui)
+  function phrase(action) {
+    if (set === "test" && action === "timer") return ["start timer five minutes", "pornește timer cinci minute"];
+    return COMMANDS.find(([a]) => a === action).slice(1);
   }
 
-  function query(extra = {}) {
-    const params = new URLSearchParams({ set: setName, condition, ...extra });
-    return params.toString();
+  function url(path, action = "") {
+    return `/api/speech/recordings${path}?set=${set}&condition=${condition}&action=${action}`;
   }
 
   async function start(container) {
     root = container;
-    armedAction = null;
+    recording = null;
     root.innerHTML = `
-      <section class="recorder">
-        <div class="page-header">
-          <div>
-            <h1>Voice recorder</h1>
-            <p class="subtitle">Record your own voice for the MFCC + DTW templates and for the evaluation test set.</p>
-          </div>
-          <button id="mic-status" class="mic-status" data-state="off" aria-label="Microphone status. Click to mute or unmute.">
-            <span class="mic-dot" aria-hidden="true"></span>
-            <span class="mic-label" aria-live="polite">Mic off</span>
-          </button>
+      <div class="page-header">
+        <div>
+          <h1>Voice recorder</h1>
+          <p class="subtitle">Record your own voice for the MFCC + DTW templates and for the evaluation test set.</p>
         </div>
+        <button id="mic-status" class="mic-status" data-action="mic" data-state="off">
+          <span class="mic-dot"></span><span class="mic-label">Mic off</span>
+        </button>
+      </div>
+      <div class="recorder-options">
+        <label>Set
+          <select id="set">
+            <option value="templates">Templates (MFCC + DTW)</option>
+            <option value="test">Test set (evaluation)</option>
+          </select>
+        </label>
+        <label id="condition-label">Condition
+          <select id="condition">
+            <option value="quiet">Quiet room</option>
+            <option value="noise">Background noise (hood, water, music)</option>
+          </select>
+        </label>
+      </div>
+      <p id="status" class="recorder-status" role="status">
+        Click “Record ${TAKES}” next to a command, then say it ${TAKES} times with a short pause between.
+      </p>
+      <table class="recorder-table">
+        <thead><tr><th>Command</th><th>Say</th><th>Saved</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>`;
 
-        <div class="recorder-options">
-          <label>Set
-            <select id="set-select">
-              <option value="templates">Templates (MFCC + DTW)</option>
-              <option value="test">Test set (evaluation)</option>
-            </select>
-          </label>
-          <label id="condition-label" hidden>Condition
-            <select id="condition-select">
-              <option value="quiet">Quiet room</option>
-              <option value="noise">Background noise (hood, water, music)</option>
-            </select>
-          </label>
-        </div>
+    root.querySelector("#set").value = set;
+    root.querySelector("#condition").value = condition;
+    root.querySelector("#set").onchange = (e) => { set = e.target.value; recording = null; refresh(); };
+    root.querySelector("#condition").onchange = (e) => { condition = e.target.value; recording = null; refresh(); };
 
-        <p id="recorder-status" class="recorder-status" role="status" aria-live="polite">
-          Click “Record ${TAKES}” next to a command, then say it ${TAKES} times with a short pause between.
-        </p>
-
-        <table class="recorder-table">
-          <thead><tr><th>Command</th><th>Say</th><th>Saved</th><th></th></tr></thead>
-          <tbody id="recorder-rows"></tbody>
-        </table>
-      </section>`;
-
-    root.querySelector("#set-select").addEventListener("change", (e) => {
-      setName = e.target.value;
-      root.querySelector("#condition-label").hidden = setName !== "test";
-      disarm();
-      refresh();
-    });
-    root.querySelector("#condition-select").addEventListener("change", (e) => {
-      condition = e.target.value;
-      disarm();
-      refresh();
-    });
-    root.querySelector("#mic-status").addEventListener("click", () => Listener.toggle());
-
-    root.querySelector("#set-select").value = setName;
-    root.querySelector("#condition-select").value = condition;
-    root.querySelector("#condition-label").hidden = setName !== "test";
+    // Toate butoanele din pagină au data-action
+    root.onclick = (event) => {
+      const button = event.target.closest("[data-action]");
+      if (!button) return;
+      const action = button.dataset.command;
+      if (button.dataset.action === "mic") Listener.toggle();
+      if (button.dataset.action === "record") toggleRecording(action);
+      if (button.dataset.action === "undo") undo(action);
+    };
 
     await refresh();
-
-    Listener.start({
-      onState: (state, label) => {
-        const box = root?.querySelector("#mic-status");
-        if (!box) return;
-        box.dataset.state = state;
-        box.querySelector(".mic-label").textContent = label;
-      },
-      onSegment: saveSegment,
-    });
+    Listener.start({ onState: showMicState, onSegment: save, onError: (message) => showStatus(message, true) });
   }
 
   function stop() {
     if (!root) return;
     Listener.stop();
+    root.onclick = null;
     root = null;
   }
 
-  // Citește de la server câte înregistrări are fiecare comandă și redesenează tabelul
   async function refresh() {
-    try {
-      const response = await fetch(`/api/speech/recordings?${query()}`);
-      counts = await response.json();
-    } catch {
-      counts = {};
-      setStatus("Cannot reach the speech service. Is Docker running?", "warn");
-    }
-    renderRows();
+    counts = await fetch(url("")).then((r) => r.json());
+    render();
   }
 
-  function renderRows() {
-    const body = root?.querySelector("#recorder-rows");
-    if (!body) return;
-    body.innerHTML = PHRASES.map(([action, en, ro]) => {
-      if (setName === "test" && action === "timer") [en, ro] = TEST_TIMER_PHRASE;
+  function render() {
+    root.querySelector("#condition-label").hidden = set !== "test";
+    root.querySelector("#rows").innerHTML = COMMANDS.map(([action]) => {
+      const [en, ro] = phrase(action);
       const n = counts[action] || 0;
-      const armed = armedAction === action;
+      const active = recording === action;
       return `
-        <tr class="${armed ? "armed" : ""}">
+        <tr class="${active ? "armed" : ""}">
           <td><code>${action}</code></td>
           <td><b>“${en}”</b><br><span class="muted">or “${ro}”</span></td>
           <td><span class="count ${n >= 3 ? "count-ok" : ""}">${n}</span></td>
-          <td class="row-actions">
-            <button class="btn btn-small ${armed ? "btn-danger" : "btn-primary"}" data-record="${action}">
-              ${armed ? `Stop (${remaining} left)` : `Record ${TAKES}`}
-            </button>
-            <button class="btn btn-small" data-undo="${action}" ${n === 0 ? "disabled" : ""}>Undo last</button>
-          </td>
+          <td><div class="row-actions">
+            <button class="btn btn-small ${active ? "btn-danger" : "btn-primary"}" data-action="record" data-command="${action}">
+              ${active ? `Stop (${left} left)` : `Record ${TAKES}`}</button>
+            <button class="btn btn-small" data-action="undo" data-command="${action}" ${n ? "" : "disabled"}>Undo last</button>
+          </div></td>
         </tr>`;
     }).join("");
-
-    body.querySelectorAll("[data-record]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const action = button.dataset.record;
-        if (armedAction === action) {
-          disarm();
-        } else {
-          armedAction = action;
-          remaining = TAKES;
-          setStatus(`Say “${phraseFor(action)}” now (${remaining} left)…`);
-        }
-        renderRows();
-      });
-    });
-
-    body.querySelectorAll("[data-undo]").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const response = await fetch(`/api/speech/recordings/last?${query({ action: button.dataset.undo })}`, { method: "DELETE" });
-        if (response.ok) counts = await response.json();
-        setStatus("Last recording deleted.");
-        renderRows();
-      });
-    });
   }
 
-  function disarm() {
-    armedAction = null;
-    remaining = 0;
+  function toggleRecording(action) {
+    recording = recording === action ? null : action;
+    left = TAKES;
+    if (recording) showStatus(`Say “${phrase(action)[0]}” now (${left} left)…`);
+    render();
+  }
+
+  async function undo(action) {
+    counts = await fetch(url("/last", action), { method: "DELETE" }).then((r) => r.json());
+    showStatus("Last recording deleted.");
+    render();
   }
 
   // listener.js ne dă fiecare frază spusă, ca fișier WAV
-  async function saveSegment(wav) {
-    if (!armedAction || !root) return; // nu înregistrăm nimic: ignorăm
-
-    const action = armedAction;
+  async function save(wav) {
+    if (!recording || !root) return;   // nu înregistrăm nimic acum: ignorăm fraza
+    const action = recording;
     const form = new FormData();
     form.append("audio", wav, "sample.wav");
 
-    try {
-      const response = await fetch(`/api/speech/recordings?${query({ action })}`, { method: "POST", body: form });
-      const data = await response.json();
-      if (!response.ok) {
-        setStatus(`${data.error || "Could not save"}`, "warn");
-        return;
-      }
-      counts = data;
-      remaining--;
-      if (remaining <= 0) {
-        disarm();
-        setStatus(`✓ Done with “${phraseFor(action)}”. Pick the next command.`);
-      } else {
-        setStatus(`✓ Saved. Say “${phraseFor(action)}” again (${remaining} left)…`);
-      }
-    } catch {
-      setStatus("Cannot reach the speech service.", "warn");
-    }
-    renderRows();
+    const response = await fetch(url("", action), { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) return showStatus(data.error, true);
+
+    counts = data;
+    left--;
+    if (left === 0) recording = null;
+    showStatus(left === 0 ? `✓ Done with “${phrase(action)[0]}”. Pick the next command.`
+                          : `✓ Saved. Say “${phrase(action)[0]}” again (${left} left)…`);
+    render();
   }
 
-  function setStatus(text, type = "ok") {
-    const box = root?.querySelector("#recorder-status");
+  function showStatus(text, isWarning = false) {
+    const box = root?.querySelector("#status");
     if (!box) return;
     box.textContent = text;
-    box.dataset.type = type;
+    box.dataset.type = isWarning ? "warn" : "ok";
+  }
+
+  function showMicState(state, label) {
+    const box = root?.querySelector("#mic-status");
+    if (!box) return;
+    box.dataset.state = state;
+    box.querySelector(".mic-label").textContent = label;
   }
 
   return { start, stop };

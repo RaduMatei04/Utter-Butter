@@ -1,80 +1,56 @@
 """
-recognizer_whisper.py: speech-to-text cu Whisper (prin biblioteca faster-whisper).
+recognizer_whisper.py: metoda A, Whisper (semnal -> text).
 
-Whisper este o rețea neuronală (encoder-decoder, de tip Transformer) antrenată
-de OpenAI pe ~680.000 de ore de vorbire. Primește semnalul audio la 16 kHz,
-calculează intern o spectrogramă log-Mel și generează textul.
-Rulează LOCAL, pe procesor, fără internet (doar prima dată descarcă modelul).
+Whisper e o rețea neuronală (Transformer) antrenată de OpenAI pe ~680.000 de ore
+de vorbire. Primește semnalul la 16 kHz și scrie textul. Rulează local, pe procesor.
 """
 
 import os
-import threading
 
 from faster_whisper import WhisperModel
 
-# Modelul: "tiny" (cel mai rapid), "base" (echilibrat), "small" (mai precis, mai lent)
-MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
-# Folderul unde se salvează modelul descărcat (un volum Docker, ca să nu-l descărcăm iar)
-MODEL_DIR = os.environ.get("WHISPER_DIR", "/models")
-
-# Comenzile pot fi în engleză sau română
-ALLOWED_LANGUAGES = ("en", "ro")
-
-# Dacă Whisper crede că un fragment NU conține vorbire cu probabilitate mai mare
-# de atât, îl ignorăm. (Pe zgomot, Whisper poate „inventa” fraze, de ex. „Thank you.”)
-NO_SPEECH_THRESHOLD = 0.6
-
-_model = None
-_lock = threading.Lock()  # un singur fragment procesat odată
+model = None   # se încarcă o singură dată, la pornirea serverului
 
 
 def load_model():
-    """Încarcă modelul în memorie (durează câteva secunde; prima dată și descărcarea)."""
-    global _model
-    with _lock:
-        if _model is None:
-            print(f"[whisper] Loading model '{MODEL_NAME}'...", flush=True)
-            # int8 = numere pe 8 biți: mai rapid și mai puțină memorie pe CPU
-            _model = WhisperModel(
-                MODEL_NAME, device="cpu", compute_type="int8", download_root=MODEL_DIR
-            )
-            print("[whisper] Model ready.", flush=True)
-    return _model
+    global model
+    if model is None:
+        print("[whisper] Loading model...", flush=True)
+        model = WhisperModel(
+            os.environ.get("WHISPER_MODEL", "base"),       # tiny / base / small
+            device="cpu", compute_type="int8",             # int8 = mai rapid pe procesor
+            download_root=os.environ.get("WHISPER_DIR", "/models"),
+        )
+        print("[whisper] Model ready.", flush=True)
 
 
 def is_ready():
-    return _model is not None
+    return model is not None
 
 
-def _run(model, signal, language):
-    """O rulare a lui Whisper. Întoarce (text, info)."""
+def run_whisper(signal, language):
     segments, info = model.transcribe(
         signal,
-        language=language,              # None = detectează automat limba
-        beam_size=1,                    # căutare simplă (greedy): mai rapid
-        temperature=0.0,
+        language=language,                 # None = Whisper ghicește singur limba
+        beam_size=1,                       # căutare simplă = mai rapid
+        vad_filter=False,                  # VAD-ul îl facem noi (preprocessing.py)
         condition_on_previous_text=False,
-        without_timestamps=True,
-        vad_filter=False,               # VAD-ul îl facem noi (pasul 5)
     )
-    # `segments` e un generator: transcrierea se face efectiv aici
-    text_parts = [s.text for s in segments if s.no_speech_prob < NO_SPEECH_THRESHOLD]
-    return "".join(text_parts).strip(), info
+    # Pe zgomot, Whisper „inventează” uneori fraze („Thank you.”).
+    # Păstrăm doar bucățile în care e sigur că s-a vorbit.
+    text = " ".join(s.text for s in segments if s.no_speech_prob < 0.6)
+    return text.strip(), info
 
 
 def transcribe(signal):
-    """Semnal (numpy float32, 16 kHz) -> (text, limba)."""
-    model = load_model()
-    with _lock:
-        text, info = _run(model, signal, None)
-        language = info.language
+    """Semnal (numpy, 16 kHz) -> (text, limba)."""
+    text, info = run_whisper(signal, language=None)
 
-        # Pe fragmente scurte, detecția automată a limbii greșește uneori
-        # (ex: „next” recunoscut ca germană). Atunci alegem dintre engleză și
-        # română limba cea mai probabilă și rulăm încă o dată.
-        if language not in ALLOWED_LANGUAGES:
-            probabilities = dict(info.all_language_probs or [])
-            language = max(ALLOWED_LANGUAGES, key=lambda lang: probabilities.get(lang, 0))
-            text, _ = _run(model, signal, language)
+    # Pe fraze scurte, Whisper poate ghici greșit limba (ex: „next” = germană).
+    # Atunci alegem engleza sau româna, care e mai probabilă, și încercăm din nou.
+    if info.language not in ("en", "ro"):
+        probabilities = dict(info.all_language_probs or [])
+        language = "ro" if probabilities.get("ro", 0) > probabilities.get("en", 0) else "en"
+        text, info = run_whisper(signal, language)
 
-    return text, language
+    return text, info.language

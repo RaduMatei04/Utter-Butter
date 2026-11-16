@@ -5,3 +5,5 @@ venv/
 .env
 evaluation/results/
 evaluation/recordings/
+# setările locale Obsidian (create automat când deschizi folderul notite/)
+notite/.obsidian/

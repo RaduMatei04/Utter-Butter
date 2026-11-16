@@ -1,20 +1,13 @@
 """
-Serviciul `speech`: lanțul complet al recunoașterii vocale.
+Serviciul `speech`: primește audio și răspunde cu comanda recunoscută.
 
-  POST /api/command?method=whisper|dtw&preprocess=1
-      corp: formular cu un câmp "audio" = fișier WAV (mono, 16 kHz, 16 biți)
-      răspuns: {"action", "value", "transcript", "language", "method",
-                "speech_detected", "speech_ms", "processing_ms", ...}
+  POST /api/command?method=whisper|dtw&preprocess=1|0
+       fișier "audio" (WAV mono 16 kHz) -> {"action", "value", "transcript", ...}
 
-  Înregistrări (pagina #/record din aplicație):
+  Pentru pagina #/record (șabloane DTW și set de test):
   GET    /api/speech/recordings?set=templates|test&condition=quiet|noise
-  POST   /api/speech/recordings?set=...&action=next&condition=...   (+ fișier "audio")
-  DELETE /api/speech/recordings/last?set=...&action=next&condition=...
-
-Lanțul:
-  WAV -> numpy -> eliminare DC -> VAD (energie + ZCR) -> tăiere liniște -> normalizare
-      -> metoda A: Whisper (text) -> interpretare (comandă)
-      -> metoda B: pre-emphasis -> MFCC -> DTW cu șabloanele -> comandă
+  POST   /api/speech/recordings?set=...&condition=...&action=next   (+ fișier "audio")
+  DELETE /api/speech/recordings/last?set=...&condition=...&action=next
 """
 
 import os
@@ -32,196 +25,121 @@ from preprocessing import SAMPLE_RATE, load_wav, preprocess
 
 app = Flask(__name__)
 
-# Dacă e setat, fiecare comandă primită se salvează ca WAV în acest folder.
-RECORDINGS_DIR = os.environ.get("SAVE_RECORDINGS_DIR")
-# Setul de test pentru evaluare: <DATASET_DIR>/<condiție>/<acțiune>/*.wav
-DATASET_DIR = Path(os.environ.get("DATASET_DIR", "/evaluation/data"))
-CONDITIONS = ("quiet", "noise")
+RECORDINGS_DIR = os.environ.get("SAVE_RECORDINGS_DIR")                   # fiecare comandă primită
+DATASET_DIR = Path(os.environ.get("DATASET_DIR", "/evaluation/data"))    # setul de test
 
-# La pornire: modelul Whisper se încarcă în fundal, iar șabloanele DTW imediat
-threading.Thread(target=recognizer_whisper.load_model, daemon=True).start()
+# La pornire: Whisper se încarcă în fundal (durează câteva secunde), șabloanele DTW imediat
+threading.Thread(target=recognizer_whisper.load_model).start()
 recognizer_dtw.load_templates()
 
 
-def timestamp():
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+def now():
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-
-def save_recording(data, action):
-    """Salvează WAV-ul primit, cu ora și comanda recunoscută în nume."""
-    if not RECORDINGS_DIR:
-        return
-    folder = Path(RECORDINGS_DIR)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / f"{timestamp()}_{action}.wav").write_bytes(data)
-
-
-# ======================================================================
-# Comenzi vocale
-# ======================================================================
 
 @app.get("/api/speech/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "model_ready": recognizer_whisper.is_ready(),
-        "dtw_templates": recognizer_dtw.template_counts(),
-    })
+    return {"model_ready": recognizer_whisper.is_ready(), "dtw_templates": recognizer_dtw.template_counts()}
 
+
+# ======================================================================
+# Comanda vocală
+# ======================================================================
 
 @app.post("/api/command")
 def command():
-    start_time = time.perf_counter()  # cronometrăm toată prelucrarea
+    start = time.perf_counter()
     method = request.args.get("method", "whisper")
-    use_vad = request.args.get("preprocess", "1") != "0"
+    use_vad = request.args.get("preprocess", "1") == "1"
 
-    if method not in ("whisper", "dtw"):
-        return jsonify({"error": "method must be 'whisper' or 'dtw'"}), 400
-
-    # 1. Primim fișierul audio
-    audio_file = request.files.get("audio")
-    if audio_file is None:
-        return jsonify({"error": "Missing 'audio' file"}), 400
-    data = audio_file.read()
-
-    # 2. WAV -> vector numpy cu valori în [-1, 1]
+    # 1. Citim fișierul audio
+    data = request.files["audio"].read()
     try:
         signal = load_wav(data)
-    except Exception as error:  # fișier stricat sau în alt format
-        return jsonify({"error": f"Invalid WAV: {error}"}), 400
+    except Exception as error:
+        return {"error": f"Invalid WAV: {error}"}, 400
 
     if method == "whisper" and not recognizer_whisper.is_ready():
-        # 503 = „serviciu indisponibil momentan”; browserul încearcă din nou mai târziu
-        return jsonify({"error": "Speech model is still loading"}), 503
-    if method == "dtw" and not recognizer_dtw.has_templates():
-        return jsonify({"error": "No DTW templates yet. Record some at #/record"}), 503
+        return {"error": "Speech model is still loading"}, 503
+    if method == "dtw" and not recognizer_dtw.templates:
+        return {"error": "No DTW templates yet. Record some at #/record"}, 503
 
-    # 3. Preprocesare: DC, VAD (energie + ZCR), tăierea liniștii, normalizare
-    clean, _ = preprocess(signal, use_vad=use_vad)
+    # 2. Preprocesare: DC, VAD, tăierea liniștii, normalizare
+    clean = preprocess(signal, use_vad)
+    result = {"method": method, "action": "unknown", "value": None, "transcript": ""}
 
-    response = {"method": method, "value": None, "language": None,
-                "speech_detected": clean is not None, "speech_ms": 0}
+    # 3. Recunoaștere (dacă VAD-ul a găsit vorbire)
+    if clean is not None and method == "whisper":
+        text, language = recognizer_whisper.transcribe(clean)
+        result.update(interpret(text), transcript=text, language=language)
+    elif clean is not None and method == "dtw":
+        dtw = recognizer_dtw.recognize(clean)
+        result.update(dtw, transcript=f"(DTW) {dtw['action']}, distance {dtw['distance']}")
 
-    if clean is None:
-        # VAD-ul nu a găsit vorbire (zgomot, clic, tuse): nu mai recunoaștem nimic
-        response.update(action="unknown", transcript="")
-    else:
-        response["speech_ms"] = round(len(clean) / SAMPLE_RATE * 1000)
+    result["speech_ms"] = 0 if clean is None else round(len(clean) / SAMPLE_RATE * 1000)
+    result["processing_ms"] = round((time.perf_counter() - start) * 1000)
+    print(f"[{method}] {result['transcript']!r} -> {result['action']} ({result['processing_ms']} ms)", flush=True)
 
-        if method == "whisper":
-            # 4A. Whisper: semnal -> text, apoi text -> comandă
-            transcript, language = recognizer_whisper.transcribe(clean)
-            result = interpret(transcript)
-            response.update(action=result["action"], value=result["value"],
-                            transcript=transcript, language=language)
-        else:
-            # 4B. MFCC + DTW: semnal -> cel mai apropiat șablon
-            result = recognizer_dtw.recognize(clean)
-            response.update(
-                action=result["action"],
-                transcript=f"(DTW) {result['action']}, distance {result['distance']}",
-                distance=result["distance"],
-                threshold=result["threshold"],
-                scores=result["scores"],
-            )
+    # 4. Salvăm înregistrarea (pentru grafice și depanare)
+    if RECORDINGS_DIR:
+        Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
+        Path(RECORDINGS_DIR, f"{now()}_{result['action']}.wav").write_bytes(data)
 
-    response["processing_ms"] = round((time.perf_counter() - start_time) * 1000)
-    print(
-        f"[command:{method}] speech {response['speech_ms']} ms | "
-        f"{response['transcript']!r} -> {response['action']} ({response['processing_ms']} ms)",
-        flush=True,
-    )
-    save_recording(data, response["action"])
-    return jsonify(response)
+    return jsonify(result)
 
 
 # ======================================================================
-# Înregistrarea șabloanelor DTW și a setului de test
+# Înregistrări pentru șabloane DTW și setul de test
 # ======================================================================
 
-def target_folder(args):
-    """Folderul în care se salvează o înregistrare, din parametrii cererii.
-    Ridică ValueError dacă parametrii sunt greșiți."""
-    set_name = args.get("set", "templates")
-    action = args.get("action")
-    if action is not None and action not in COMMANDS:
-        raise ValueError(f"Unknown action '{action}'")
-
-    if set_name == "templates":
-        base = recognizer_dtw.TEMPLATES_DIR
-    elif set_name == "test":
-        condition = args.get("condition", "quiet")
-        if condition not in CONDITIONS:
-            raise ValueError(f"condition must be one of {CONDITIONS}")
-        base = DATASET_DIR / condition
-    else:
-        raise ValueError("set must be 'templates' or 'test'")
-
-    return base if action is None else base / action
+def recordings_folder():
+    """Folderul ales prin parametrii cererii: șabloanele DTW sau setul de test."""
+    if request.args.get("set") == "test":
+        condition = request.args.get("condition", "quiet")
+        if condition not in ("quiet", "noise"):
+            raise ValueError("condition must be 'quiet' or 'noise'")
+        return DATASET_DIR / condition
+    return recognizer_dtw.TEMPLATES_DIR
 
 
-def count_recordings(base):
-    """Câte fișiere WAV există pentru fiecare acțiune."""
-    return {
-        action: len(list((base / action).glob("*.wav"))) if (base / action).exists() else 0
-        for action in COMMANDS
-    }
+def count_per_command(folder):
+    return {action: len(list((folder / action).glob("*.wav"))) for action in COMMANDS}
 
 
 @app.get("/api/speech/recordings")
 def list_recordings():
-    try:
-        base = target_folder({**request.args, "action": None})
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 400
-    return jsonify(count_recordings(base))
+    return count_per_command(recordings_folder())
 
 
 @app.post("/api/speech/recordings")
 def add_recording():
-    try:
-        folder = target_folder(request.args)
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 400
-    if not request.args.get("action"):
-        return jsonify({"error": "Missing 'action'"}), 400
+    folder = recordings_folder()
+    action = request.args.get("action")
+    if action not in COMMANDS:
+        return {"error": "Unknown command"}, 400
 
-    audio_file = request.files.get("audio")
-    if audio_file is None:
-        return jsonify({"error": "Missing 'audio' file"}), 400
-    data = audio_file.read()
+    data = request.files["audio"].read()
+    if preprocess(load_wav(data)) is None:
+        return {"error": "No speech detected, please try again"}, 422
 
-    # Verificăm că e un WAV bun și că VAD-ul găsește vorbire în el
-    try:
-        clean, _ = preprocess(load_wav(data))
-    except Exception as error:
-        return jsonify({"error": f"Invalid WAV: {error}"}), 400
-    if clean is None:
-        return jsonify({"error": "No speech detected, please try again"}), 422
-
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / f"{timestamp()}.wav").write_bytes(data)
-
-    if request.args.get("set", "templates") == "templates":
-        recognizer_dtw.load_templates()  # noile șabloane se folosesc imediat
-
-    return jsonify(count_recordings(folder.parent))
+    (folder / action).mkdir(parents=True, exist_ok=True)
+    (folder / action / f"{now()}.wav").write_bytes(data)
+    if folder == recognizer_dtw.TEMPLATES_DIR:
+        recognizer_dtw.load_templates()   # șablonul nou se folosește imediat
+    return count_per_command(folder)
 
 
 @app.delete("/api/speech/recordings/last")
 def delete_last_recording():
-    """Șterge cea mai nouă înregistrare a unei comenzi (pentru „Undo”)."""
-    try:
-        folder = target_folder(request.args)
-    except ValueError as error:
-        return jsonify({"error": str(error)}), 400
-
-    files = sorted(folder.glob("*.wav")) if folder.exists() else []
-    if not files:
-        return jsonify({"error": "Nothing to delete"}), 404
-    files[-1].unlink()
-
-    if request.args.get("set", "templates") == "templates":
+    folder = recordings_folder()
+    files = sorted((folder / request.args.get("action", "")).glob("*.wav"))
+    if files:
+        files[-1].unlink()   # cel mai nou fișier (numele începe cu data și ora)
+    if folder == recognizer_dtw.TEMPLATES_DIR:
         recognizer_dtw.load_templates()
+    return count_per_command(folder)
 
-    return jsonify(count_recordings(folder.parent))
+
+@app.errorhandler(ValueError)
+def bad_request(error):
+    return {"error": str(error)}, 400
